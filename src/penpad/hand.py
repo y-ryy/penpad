@@ -31,6 +31,7 @@ except ImportError:  # pragma: no cover
     _pathops = None
 
 from . import fonts
+from .cjk import is_cjk, is_cjk_punct, punct_kerning_targets
 
 DIGITS = frozenset("0123456789")
 SPACES = {" ": 0.52, "\u2009": 0.17, "\u2005": 0.25, "\u2003": 1.0}   # widths in letter sizes
@@ -136,19 +137,32 @@ class Hand:
         self._rot = _OU(self.rng, 0.85)
         self._size = _OU(self.rng, 0.92)
         self._drift = _OU(self.rng, 0.93)
+        self._smooth_drift = _OU(self.rng, 0.72)
+        self._wave_phase = self.rng.uniform(0, 6.28)
         self._tilt = _OU(self.rng, 0.6)
         self._last = {}
         self.glyphs = 0
-        self._history = []   # (rot, skew, grow) per glyph for diagnostics/tests
+        self._history = []      # (rot, skew, grow) per glyph for diagnostics/tests
+        self._dy_history = []   # vertical baseline offset (px) per glyph for continuity tests
 
     # ------------------------------------------------------------ font choice
     def font_for(self, s: str, i: int) -> str | None:
         """Font pinned for s[i], or None to pick between the main font and alternates."""
         e, ch = self.style, s[i]
-        lone = ch.isascii() and ch.isalpha() and not (i > 0 and s[i - 1].isalpha()) \
-            and not (i + 1 < len(s) and s[i + 1].isalpha())
-        if lone and e.get("isolated_font"):
-            return e.get("isolated", {}).get(ch, e["isolated_font"])
+        cjk_font = e.get("cjk_font")
+        if is_cjk(ch) and cjk_font and fonts.has(cjk_font, ch):
+            return cjk_font
+        prev_ascii = i > 0 and s[i - 1].isascii() and s[i - 1].isalpha()
+        next_ascii = i + 1 < len(s) and s[i + 1].isascii() and s[i + 1].isalpha()
+        lone = ch.isascii() and ch.isalpha() and not prev_ascii and not next_ascii
+        if lone:
+            iso = e.get("isolated", {})
+            if ch in iso:
+                return iso[ch]
+            if e.get("isolated_font"):
+                return e["isolated_font"]
+        if ch.isascii() and ch.isupper() and e.get("caps_font") and fonts.has(e["caps_font"], ch):
+            return e["caps_font"]
         if ch in e.get("pinned", {}):
             return e["pinned"][ch]
         if ord(ch) in GREEK and fonts.has(e.get("greek_font"), ch):
@@ -157,6 +171,8 @@ class Hand:
 
     def _pick_font(self, s, i):
         e, ch = self.style, s[i]
+        cjk_font = e.get("cjk_font")
+        extra = (cjk_font,) if cjk_font else ()
         if ch in DIGITS:
             f = e["font"]
         else:
@@ -166,7 +182,106 @@ class Hand:
                 pool = [a for a in e["alternates"] if fonts.has(a, ch)]
                 if pool and fonts.has(f, ch) and self.rng.random() < e.get("alternate_rate", 0.25):
                     f = self.rng.choice(pool)
-        return fonts.resolve(f, ch)
+        return fonts.resolve(f, ch, extra_fallbacks=extra)
+
+    def _resolve_cjk_scale(self, font: str) -> float:
+        cs = self.style.get("cjk_scale", 1.0)
+        if cs == "auto":
+            target = float(self.style.get("cjk_target_height", 0.90))
+            h = fonts.cjk_height(font)
+            return max(0.85, min(1.45, target / h))
+        return float(cs)
+
+    def cjk_visual_scale(self) -> float:
+        """Effective height ratio of CJK characters relative to nominal size."""
+        e = self.style
+        f = e.get("cjk_font") or e["font"]
+        if not f or f not in fonts.FONTS:
+            return 1.0
+        return self._resolve_cjk_scale(f) * fonts.cjk_height(f)
+
+    def _glyph_scale(self, ch: str, font: str, size: float) -> float:
+        e = self.style
+        upem = fonts.units_per_em(font)
+        scale = size / upem
+        cjk = is_cjk(ch)
+        if cjk:
+            scale *= self._resolve_cjk_scale(font)
+        else:
+            latin_scale = float(e.get("latin_scale", 1.0))
+            if ch.isascii() and ch.isupper():
+                cs = e.get("caps_scale", 1.0)
+                if cs == "auto":
+                    scale *= max(0.55, min(1.25, 0.68 / fonts.cap_height(font)))
+                elif float(cs) != 1.0:
+                    scale *= float(cs)
+                elif latin_scale != 1.0 and font == e["font"]:
+                    scale *= latin_scale
+            elif ch.isascii() and (ch.isalpha() or ch in DIGITS):
+                if latin_scale != 1.0 and font == e["font"]:
+                    scale *= latin_scale
+                if font != e["font"] and e.get("match_x_height", True) and ch.islower():
+                    ref_x = fonts.x_height(e["font"]) * latin_scale
+                    k = ref_x / fonts.x_height(font)
+                    scale *= max(0.75, min(1.35, k))
+            elif font != e["font"] and e.get("match_x_height", True) and ch.islower():
+                k = fonts.x_height(e["font"]) / fonts.x_height(font)
+                scale *= max(0.75, min(1.35, k))
+        fscales = e.get("font_scales")
+        if fscales and font in fscales:
+            scale *= float(fscales[font])
+        return scale
+
+    def _punct_adjust(self, ch: str, font: str, upem: int, adv: float) -> tuple[float, float]:
+        """Optical sidebearing trim for over-padded fullwidth CJK punctuation.
+
+        Returns (shift_x_fu, effective_adv_fu) in font units.
+        """
+        if not self.style.get("cjk_punct_squeeze", True) or not is_cjk_punct(ch):
+            return 0.0, adv
+        targets = punct_kerning_targets(ch)
+        if targets is None:
+            return 0.0, adv
+        b = fonts.glyph_bounds(font, ch)
+        if b is None:
+            return 0.0, adv
+        xmin, _, xmax, _, raw_adv, _ = b
+        gw = max(0.0, xmax - xmin)
+        lsb = xmin
+        rsb = raw_adv - xmax
+        t_lsb = targets[0] * upem
+        t_rsb = targets[1] * upem
+        shift_x = -(lsb - t_lsb) if lsb > t_lsb else 0.0
+        eff_lsb = min(lsb, t_lsb) if lsb > 0 else lsb
+        eff_rsb = min(rsb, t_rsb) if rsb > 0 else rsb
+        eff_adv = max(gw + 0.12 * upem, gw + eff_lsb + eff_rsb)
+        return shift_x, min(adv, eff_adv)
+
+    def measure(self, s: str, size: float = 18) -> float:
+        """Fast deterministic horizontal width estimate (no RNG state mutation or pathops)."""
+        e = self.style
+        u = size / 24.0
+        jit = e["jitter"]
+        total = 0.0
+        for i, ch in enumerate(s):
+            if ch in SPACES:
+                total += size * SPACES[ch]
+                continue
+            font = self._pick_font(s, i)
+            if font is None:
+                total += size * 0.52
+                continue
+            rec = fonts.outline(font, ch)
+            upem = fonts.units_per_em(font)
+            adv = rec[1] if rec is not None else upem * 0.5
+            _, adv = self._punct_adjust(ch, font, upem, adv)
+            scale = self._glyph_scale(ch, font, size)
+            w = (adv or upem * 0.5) * scale
+            if is_cjk(ch):
+                total += w + e.get("cjk_tracking", 0.0) * size + 0.20 * jit * u
+            else:
+                total += w + 0.35 * jit * u
+        return total
 
     # ------------------------------------------------------------ glyph shape
     def _variant(self, font, ch):
@@ -180,8 +295,104 @@ class Hand:
         self._last[(font, ch)] = v
         return random.Random(_stable_seed(self.seed, font, ch, v))
 
-    def _deform_ops(self, font, ch, vr, noise):
-        """Return deformed glyph drawing ops and advance width in font units."""
+    def _deform_ops(self, font, ch, vr, noise, cjk: bool = False):
+        """Return deformed glyph drawing ops and advance width in font units.
+
+        For CJK glyphs, applies two structure-preserving layers:
+        1. Hole-bound connected-component transforms (micro translation, rotation around
+           component centroid, and independent X/Y scale), keeping inner holes locked to
+           their parent stroke so walls never tear or collapse.
+        2. A smooth 2D bilinear elastic warp field across the glyph box, giving single-contour
+           cursive characters (like ``的`` or ``十``) organic stroke-level variation too.
+        """
+        if cjk:
+            comp_rec = fonts.glyph_components(font, ch)
+            if comp_rec is None:
+                return None, 0
+            components, adv, (gxmin, gymin, gxmax, gymax) = comp_rec
+            if not components:
+                return (), adv
+            upem = fonts.units_per_em(font)
+            e, r = self.style, self.rng
+            share = float(e["instance_noise"])
+            comp_shift = float(e.get("cjk_component_shift", 0.022)) * upem
+            comp_rot = float(e.get("cjk_component_rot", 2.2))
+            comp_scale = float(e.get("cjk_component_scale", 0.045))
+            elastic = float(e.get("cjk_elastic", 0.024)) * upem
+
+            # Layer 2: smooth 2D bilinear elastic warp field (zero-mean 4 corner anchors)
+            def _anchor():
+                return (
+                    vr.gauss(0.0, elastic * 0.65) + r.gauss(0.0, elastic * 0.35 * share),
+                    vr.gauss(0.0, elastic * 0.65) + r.gauss(0.0, elastic * 0.35 * share),
+                )
+
+            if elastic > 1e-4:
+                c00, c10, c01, c11 = _anchor(), _anchor(), _anchor(), _anchor()
+                mx = 0.25 * (c00[0] + c10[0] + c01[0] + c11[0])
+                my = 0.25 * (c00[1] + c10[1] + c01[1] + c11[1])
+                cap = elastic * 1.4
+                corners = tuple(
+                    (max(-cap, min(cap, cx - mx)), max(-cap, min(cap, cy - my)))
+                    for cx, cy in (c00, c10, c01, c11)
+                )
+            else:
+                corners = ((0.0, 0.0),) * 4
+
+            gw = max(gxmax - gxmin, 0.25 * upem)
+            gh = max(gymax - gymin, 0.25 * upem)
+
+            # Layer 1: per-component transforms (zero-mean translation so glyph stays centered)
+            n_comp = len(components)
+            c_xforms = []
+            if n_comp >= 2 and (comp_shift > 1e-4 or comp_rot > 1e-4 or comp_scale > 1e-4):
+                dxs, dys = [], []
+                for _ in range(n_comp):
+                    dx = vr.gauss(0.0, comp_shift * 0.70) + r.gauss(0.0, comp_shift * 0.35 * share)
+                    dy = vr.gauss(0.0, comp_shift * 0.70) + r.gauss(0.0, comp_shift * 0.35 * share)
+                    dxs.append(max(-comp_shift, min(comp_shift, dx)))
+                    dys.append(max(-comp_shift, min(comp_shift, dy)))
+                mdx = sum(dxs) / n_comp
+                mdy = sum(dys) / n_comp
+                for k in range(n_comp):
+                    ang = vr.gauss(0.0, comp_rot * 0.65) + r.gauss(0.0, comp_rot * 0.35 * share)
+                    ang = math.radians(max(-comp_rot, min(comp_rot, ang)))
+                    sx = 1.0 + max(-comp_scale, min(comp_scale,
+                                   vr.gauss(0.0, comp_scale * 0.65) + r.gauss(0.0, comp_scale * 0.35 * share)))
+                    sy = 1.0 + max(-comp_scale, min(comp_scale,
+                                   vr.gauss(0.0, comp_scale * 0.65) + r.gauss(0.0, comp_scale * 0.35 * share)))
+                    c_xforms.append((dxs[k] - mdx, dys[k] - mdy, math.cos(ang), math.sin(ang), sx, sy))
+            else:
+                c_xforms = [(0.0, 0.0, 1.0, 0.0, 1.0, 1.0)] * n_comp
+
+            fine = upem * noise * 0.08 * (0.5 + share)
+            c00, c10, c01, c11 = corners
+            deformed = []
+            for (c_ops, (cx, cy), _), (dx, dy, cs, sn, sx, sy) in zip(components, c_xforms):
+                def _xform_cjk(pt, _cx=cx, _cy=cy, _dx=dx, _dy=dy, _cs=cs, _sn=sn, _sx=sx, _sy=sy):
+                    # 1. Per-component local scale + rotation around centroid + offset
+                    lx = (pt[0] - _cx) * _sx
+                    ly = (pt[1] - _cy) * _sy
+                    x = _cx + lx * _cs - ly * _sn + _dx
+                    y = _cy + lx * _sn + ly * _cs + _dy
+                    # 2. Smooth 2D bilinear elastic warp field
+                    if elastic > 1e-4:
+                        s = max(0.0, min(1.0, (x - gxmin) / gw))
+                        t = max(0.0, min(1.0, (y - gymin) / gh))
+                        ms, mt = 1.0 - s, 1.0 - t
+                        wx = ms * mt * c00[0] + s * mt * c10[0] + ms * t * c01[0] + s * t * c11[0]
+                        wy = ms * mt * c00[1] + s * mt * c10[1] + ms * t * c01[1] + s * t * c11[1]
+                        x += wx
+                        y += wy
+                    if fine > 1e-4:
+                        x += r.gauss(0.0, fine)
+                        y += r.gauss(0.0, fine)
+                    return (x, y)
+
+                for op, args in c_ops:
+                    deformed.append((op, tuple(None if a is None else _xform_cjk(a) for a in args)))
+            return deformed, adv
+
         rec = fonts.outline(font, ch)
         if rec is None:
             return None, 0
@@ -254,28 +465,38 @@ class Hand:
         glyphs = []
         for i, ch in enumerate(s):
             if ch in SPACES:
-                glyphs.append((ch, None, size * SPACES[ch], 1.0, None, None))
+                glyphs.append((ch, None, size * SPACES[ch], 1.0, None, None, False, 0.0))
                 continue
             font = self._pick_font(s, i)
             if font is None:
-                glyphs.append((ch, None, size * 0.5, 1.0, None, None))
+                glyphs.append((ch, None, size * 0.5, 1.0, None, None, False, 0.0))
                 continue
+            cjk = is_cjk(ch)
             vr = self._variant(font, ch)
-            noise = e["glyph_noise"] * (e["digit_noise"] if ch in DIGITS else 1.0)
-            ops, adv = self._deform_ops(font, ch, vr, noise)
+            if cjk:
+                cjk_noise = e.get("cjk_glyph_noise")
+                noise = float(cjk_noise) if cjk_noise is not None else e["glyph_noise"] * 0.55
+            else:
+                noise = e["glyph_noise"] * (e["digit_noise"] if ch in DIGITS else 1.0)
+            ops, adv = self._deform_ops(font, ch, vr, noise, cjk=cjk)
             upem = fonts.units_per_em(font)
-            scale = size / upem
-            if font != e["font"] and e.get("match_x_height", True) and ch.islower():
-                k = fonts.x_height(e["font"]) / fonts.x_height(font)
-                scale *= max(0.75, min(1.35, k))
-            glyphs.append((ch, ops, (adv or upem * 0.5) * scale, scale, vr, font))
+            shift_x_fu, eff_adv = self._punct_adjust(ch, font, upem, adv or upem * 0.5)
+            scale = self._glyph_scale(ch, font, size)
+            glyphs.append((ch, ops, eff_adv * scale, scale, vr, font, cjk, shift_x_fu))
 
         total = sum(g[2] for g in glyphs) + 0.45 * jit * u * len(glyphs)
         cx = x - total / 2 if anchor == "middle" else (x - total if anchor == "end" else x)
         start = cx
-        phase = r.uniform(0, 6.28)
-        tilt = self._tilt.step(1.0 * loose)
-        tilt_mat = _rotate_around(tilt, x, y)
+        use_smooth = bool(e.get("smooth_baseline")) or bool(e.get("cjk_font")) or any(g[6] for g in glyphs)
+        if use_smooth:
+            # Avoid rigid lever-arm rotation across long coalesced CJK runs; baseline sway is
+            # driven by the continuous cross-token oscillating wave below (上→中→中→下→下→中→中→上).
+            phase = 0.0
+            tilt_mat = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+        else:
+            phase = r.uniform(0, 6.28)
+            tilt = self._tilt.step(1.0 * loose)
+            tilt_mat = _rotate_around(tilt, x, y)
 
         out = []
         word_parts = []
@@ -292,30 +513,61 @@ class Hand:
             word_color = None
             word_retraces = []
 
-        for i, (ch, ops, w, scale, vr, font) in enumerate(glyphs):
+        cjk_max_rot = min(MAX_ROTATION, float(e.get("cjk_max_rotation", 3.5)))
+        cjk_max_skew = min(MAX_SKEW, float(e.get("cjk_max_skew", 4.5)))
+        cjk_max_scale = min(MAX_SCALE, float(e.get("cjk_max_scale", 0.08)))
+        cjk_tracking = float(e.get("cjk_tracking", 0.0))
+
+        for i, (ch, ops, w, scale, vr, font, cjk, shift_x_fu) in enumerate(glyphs):
             if not ops:
                 flush_word()
                 cx += (w if ch in SPACES else max(w, size * 0.52)) + r.uniform(0.0, 1.6) * jit * u
                 continue
             self.glyphs += 1
-            rot = vr.uniform(-2.5, 2.5) * jit + self._rot.step(2.2 * jit) + r.uniform(-1.5, 1.5) * jit
-            skew = (e["slant"] + vr.uniform(-2.5, 2.5) * jit + self._slant.step(3.2 * jit)
-                    + r.uniform(-2.0, 2.0) * jit)
-            grow = vr.uniform(-0.05, 0.05) * jit + self._size.step(0.07 * jit) + r.uniform(-0.03, 0.03) * jit
-            rot = max(-MAX_ROTATION, min(MAX_ROTATION, rot))
-            skew = max(e["slant"] - MAX_SKEW, min(e["slant"] + MAX_SKEW, skew))
-            grow = max(-MAX_SCALE, min(MAX_SCALE, grow))
+            if cjk:
+                rot = vr.uniform(-1.8, 1.8) * jit + self._rot.step(1.4 * jit) + r.uniform(-1.0, 1.0) * jit
+                skew = (e["slant"] * 0.45 + vr.uniform(-1.5, 1.5) * jit + self._slant.step(1.8 * jit)
+                        + r.uniform(-1.0, 1.0) * jit)
+                grow = vr.uniform(-0.03, 0.03) * jit + self._size.step(0.04 * jit) + r.uniform(-0.02, 0.02) * jit
+                rot = max(-cjk_max_rot, min(cjk_max_rot, rot))
+                skew = max(e["slant"] * 0.45 - cjk_max_skew, min(e["slant"] * 0.45 + cjk_max_skew, skew))
+                grow = max(-cjk_max_scale, min(cjk_max_scale, grow))
+            else:
+                rot = vr.uniform(-2.5, 2.5) * jit + self._rot.step(2.2 * jit) + r.uniform(-1.5, 1.5) * jit
+                skew = (e["slant"] + vr.uniform(-2.5, 2.5) * jit + self._slant.step(3.2 * jit)
+                        + r.uniform(-2.0, 2.0) * jit)
+                grow = vr.uniform(-0.05, 0.05) * jit + self._size.step(0.07 * jit) + r.uniform(-0.03, 0.03) * jit
+                rot = max(-MAX_ROTATION, min(MAX_ROTATION, rot))
+                skew = max(e["slant"] - MAX_SKEW, min(e["slant"] + MAX_SKEW, skew))
+                grow = max(-MAX_SCALE, min(MAX_SCALE, grow))
             self._history.append((rot, skew, grow))
 
-            dy = (self._drift.step(2.4 * loose) + math.sin(phase + i * 0.8) * jit
-                  + r.uniform(-1.0, 1.0) * jit) * u
+            if use_smooth:
+                # Continuous oscillating wave across tokens: smooth 上→中→中→下→下→中→中→上
+                step_rad = (0.44 if cjk else 0.28) * (0.85 + 0.30 * r.random())
+                self._wave_phase += step_rad
+                wave = 1.55 * loose * math.sin(self._wave_phase)
+                mdrift = self._smooth_drift.step(0.45 * loose)
+                micro = r.uniform(-0.32, 0.32) * jit
+                max_dy = 2.4 * max(0.45, loose) * u
+                dy = max(-max_dy, min(max_dy, (wave + mdrift + micro) * u))
+            else:
+                dy = (self._drift.step(2.4 * loose) + math.sin(phase + i * 0.8) * jit
+                      + r.uniform(-1.0, 1.0) * jit) * u
+            self._dy_history.append(dy)
             sx = scale * (1 + grow)
-            sy = scale * (1 + grow + vr.uniform(-0.05, 0.05))
+            sy = scale * (1 + grow + vr.uniform(-0.03 if cjk else -0.05, 0.03 if cjk else 0.05))
             c = _tone(color, r, e["tone_variation"] * loose) if e["tone_variation"] else color
-            # Keep pen weight consistent across the page (compensate thinner borrowed fonts like Bad Script)
-            thin_boost = 0.45 if font == "Bad Script" and e["font"] != "Bad Script" else 0.0
-            sw_px = (r.uniform(0.65, 1.05) + thin_boost) * e["pressure"] * max(0.75, u)
-            mat = _mat_mul(tilt_mat, _letter_matrix(cx, y + dy, rot, skew, sx, -sy))
+            if cjk:
+                cjk_p = e.get("cjk_pressure")
+                press = float(cjk_p) if cjk_p is not None else min(float(e["pressure"]), 0.25)
+                sw_px = r.uniform(0.70, 1.05) * press * max(0.75, u)
+            else:
+                # Keep pen weight consistent across the page (compensate thinner borrowed fonts like Bad Script)
+                thin_boost = 0.45 if font == "Bad Script" and e["font"] != "Bad Script" else 0.0
+                sw_px = (r.uniform(0.65, 1.05) + thin_boost) * e["pressure"] * max(0.75, u)
+            gx = cx + shift_x_fu * sx
+            mat = _mat_mul(tilt_mat, _letter_matrix(gx, y + dy, rot, skew, sx, -sy))
             d = self._render_ops(ops, mat, sw_px)
 
             if word_color is not None and c != word_color:
@@ -333,11 +585,11 @@ class Hand:
                 if bar:
                     word_parts.append(bar)
 
-            if e["retrace"] and ch not in DIGITS and r.random() < e["retrace"] * loose:
+            if e["retrace"] and ch not in DIGITS and not cjk and r.random() < e["retrace"] * loose:
                 mat2 = _mat_mul(
                     tilt_mat,
                     _letter_matrix(
-                        cx + r.uniform(-0.8, 0.8),
+                        gx + r.uniform(-0.8, 0.8),
                         y + dy + r.uniform(-0.8, 0.8),
                         rot + r.uniform(-2, 2),
                         skew,
@@ -349,7 +601,10 @@ class Hand:
                 if rt_d:
                     word_retraces.append((rt_d, c))
 
-            cx += w * (1 + grow * 0.5) + r.uniform(-0.5, 1.2) * jit * u
+            if cjk:
+                cx += w * (1 + grow * 0.35) + cjk_tracking * size + r.uniform(-0.3, 0.7) * jit * u
+            else:
+                cx += w * (1 + grow * 0.5) + r.uniform(-0.5, 1.2) * jit * u
 
         flush_word()
         return "<g>%s</g>" % "".join(out), cx - start

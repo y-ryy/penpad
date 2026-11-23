@@ -22,7 +22,8 @@ SYMBOLS = {
     "partial": "∂", "nabla": "∇", "cdot": "·", "times": "×", "div": "÷", "pm": "±", "mp": "∓",
     "infty": "∞", "to": "→", "rightarrow": "→", "longrightarrow": "→", "Rightarrow": "⇒",
     "implies": "⇒", "leftarrow": "←", "iff": "⇔", "neq": "≠", "ne": "≠", "leq": "≤", "le": "≤",
-    "geq": "≥", "ge": "≥", "approx": "≈", "sim": "~", "simeq": "≃", "equiv": "≡", "propto": "∝",
+    "geq": "≥", "ge": "≥", "ll": "≪", "gg": "≫", "approx": "≈", "sim": "~", "simeq": "≃", "equiv": "≡", "propto": "∝",
+    "therefore": "∴", "because": "∵", "angle": "∠", "triangle": "△",
     "sum": "∑", "prod": "∏", "int": "∫", "oint": "∮", "circ": "°", "degree": "°", "prime": "'",
     "in": "∈", "forall": "∀", "exists": "∃", "cup": "∪", "cap": "∩", "subset": "⊂",
     "ldots": "...", "dots": "...", "cdots": "···", "|": "‖", "Vert": "‖", "parallel": "‖", "perp": "⊥", "langle": "⟨", "rangle": "⟩",
@@ -46,8 +47,8 @@ def _tokens(s):
         c = s[i]
         if c == "\\" and i + 1 < len(s):
             j = i + 1
-            if s[j].isalpha():
-                while j < len(s) and s[j].isalpha():
+            if s[j].isascii() and s[j].isalpha():
+                while j < len(s) and s[j].isascii() and s[j].isalpha():
                     j += 1
                 yield "\\" + s[i + 1:j]
                 i = j
@@ -59,7 +60,7 @@ def _tokens(s):
             i += 1
 
 
-BINARY = set("=<>+−±×≠≈≤≥→⇒⇔≡∝∈~") | {"-"}
+BINARY = set("=<>+−±×≠≈≤≥≪≫→⇒⇔≡∝∈~") | {"-"}
 OPENERS = set("([{,=") | BINARY
 
 

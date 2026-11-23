@@ -11,7 +11,7 @@ import time
 from . import __version__
 from .document import render_markdown
 from .paper import PAPERS
-from .styles import INKS, STYLES
+from .styles import DENSITIES, INKS, STYLES
 
 DEMO = r"""# 1) Material derivative
 A particle at $(x(t), y(t), z(t))$ moves with the flow:
@@ -45,6 +45,34 @@ def _write(src, out, a):
         overrides["jitter"] = a.jitter
     if a.slant is not None:
         overrides["slant"] = a.slant
+    if getattr(a, "font", None):
+        overrides["font"] = a.font
+    if getattr(a, "cjk_font", None):
+        if getattr(a, "pure_cjk", False):
+            from .styles import cjk_style as _cjk_style
+            overrides = _cjk_style(
+                a.cjk_font, pure_cjk=True,
+                monochrome=getattr(a, "monochrome", None),
+                density=getattr(a, "density", None) or "normal",
+                **overrides,
+            )
+            nb = render_markdown(src, paper=a.paper, style=overrides, seed=a.seed, footer=a.footer)
+            paths = nb.save(out, dpi=a.dpi, jobs=a.jobs, vector_pdf=not a.raster)
+            n = len(nb.pages)
+            if not a.quiet:
+                print("%s  %d page%s  %.1fs" % (", ".join(paths), n, "" if n == 1 else "s", time.time() - t0))
+            return 0
+        overrides["cjk_font"] = a.cjk_font
+        if getattr(a, "cjk_scale", None) is None and a.style != "cjk":
+            overrides["cjk_scale"] = "auto"
+    if getattr(a, "cjk_scale", None) is not None:
+        overrides["cjk_scale"] = "auto" if a.cjk_scale == "auto" else float(a.cjk_scale)
+    if getattr(a, "line_spacing", None) is not None:
+        overrides["line_spacing"] = a.line_spacing
+    if getattr(a, "density", None):
+        overrides["density"] = a.density
+    if getattr(a, "monochrome", None):
+        overrides["monochrome"] = a.monochrome
     nb = render_markdown(src, paper=a.paper, style=a.style, seed=a.seed, footer=a.footer, **overrides)
     paths = nb.save(out, dpi=a.dpi, jobs=a.jobs, vector_pdf=not a.raster)
     n = len(nb.pages)
@@ -96,6 +124,15 @@ def main(argv=None):
         p.add_argument("--paper", default="goodnotes", choices=sorted(PAPERS))
         p.add_argument("--style", default="cursive", choices=sorted(STYLES))
         p.add_argument("--seed", type=int, default=1, help="same seed, same handwriting")
+        p.add_argument("--font", help="main handwriting font (name or .ttf/.otf/.woff2 path)")
+        p.add_argument("--cjk-font", help="CJK handwriting font (.ttf/.otf/.woff2 path or registered name)")
+        p.add_argument("--pure-cjk", action="store_true",
+                       help="use --cjk-font for both Chinese and Latin (keeping Virgil for Greek)")
+        p.add_argument("--cjk-scale", help="CJK scale multiplier (float or 'auto')")
+        p.add_argument("--line-spacing", type=float, help="extra line spacing in ruling pitches (e.g. 0.25)")
+        p.add_argument("--density", choices=DENSITIES, help="layout density: compact, normal or spacious")
+        p.add_argument("--monochrome", nargs="?", const="black",
+                       help="render all ink in one color (default: black, or specify ink name/#hex)")
         p.add_argument("--jitter", type=float, help="letter wobble (style default ~0.7)")
         p.add_argument("--slant", type=float, help="mean slant in degrees, positive leans right")
         p.add_argument("--footer", help="text written at the bottom of every page, before the page number")

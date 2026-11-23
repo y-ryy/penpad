@@ -1,0 +1,10 @@
+{
+  "cjk_font": "out/未知手写体_1.ttf",
+  "preset": "hw-black",
+  "paper": "goodnotes",
+  "density": "compact",
+  "seed": 88,
+  "dpi": 160,
+  "min_orphan_lines": 3,
+  "stroke_offset": "default"
+}

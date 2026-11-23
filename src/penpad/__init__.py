@@ -16,7 +16,7 @@ from .hand import Hand  # noqa: E402
 from .latex import latex_to_markup  # noqa: E402
 from .notebook import Notebook  # noqa: E402
 from .paper import PAPERS, Paper  # noqa: E402
-from .styles import INKS, STYLES  # noqa: E402
+from .styles import INKS, STYLES, cjk_style  # noqa: E402
 
-__all__ = ["Notebook", "Hand", "Paper", "PAPERS", "STYLES", "INKS", "render_markdown",
+__all__ = ["Notebook", "Hand", "Paper", "PAPERS", "STYLES", "INKS", "cjk_style", "render_markdown",
            "latex_to_markup", "register_font", "__version__"]

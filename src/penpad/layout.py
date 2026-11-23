@@ -9,12 +9,15 @@ from __future__ import annotations
 import math
 import random
 
+from . import fonts
+from .cjk import ASCII_NO_START, CJK_CLOSE_PUNCT, CJK_OPEN_PUNCT, has_cjk, is_cjk, is_cjk_ideograph
 from .hand import _stable_seed, hand_line
 
-DRAWN = frozenset("→⇒∇‖∮∫≠·≈")
+CIRCLED_DIGITS = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳"
+DRAWN = frozenset("→⇒∇‖∮∫≠·•≈≪≫" + CIRCLED_DIGITS)
 ACCENTS = {"̂": "hat", "̇": "dot", "̈": "ddot", "⃗": "vec", "̄": "bar", "̃": "tilde"}
 SHORT = set("acemnorsuvwxzıαεικνοπστυωηρμγ")   # letters without ascenders: accents sit lower
-OPERATORS = {"=", ">", "<", "≠", "≈", "+", "−", "-", "~", "≤", "≥", "→", "⇒", "·", "×"}
+OPERATORS = {"=", ">", "<", "≠", "≈", "+", "−", "-", "~", "≤", "≥", "≪", "≫", "→", "⇒", "·", "×"}
 ESCAPABLE = "\\_^{}"
 
 
@@ -128,7 +131,12 @@ class Text(Item):
         super().__init__()
         svg, w = hand.write(0, 0, s, color, size)
         self.parts.append((color, svg))
-        self.w, self.asc, self.desc = w, 0.78 * size, 0.26 * size
+        asc, desc = 0.78 * size, 0.26 * size
+        if has_cjk(s):
+            cjk_h = hand.cjk_visual_scale() * size
+            asc = max(asc, 0.88 * cjk_h)
+            desc = max(desc, 0.22 * cjk_h)
+        self.w, self.asc, self.desc = w, asc, desc
 
 
 class Symbol(Item):
@@ -199,6 +207,21 @@ class Symbol(Item):
         elif ch == "·":
             p.append((color, '<circle cx="%.1f" cy="%.1f" r="%.2f" fill="%s"/>' % (j(0.2 * t), j(-0.3 * t), 0.06 * t, color)))
             self.w = 0.4 * t
+        elif ch == "•":
+            # Organic hand-drawn bullet dot (closed wobbly dot, never a raw Markdown dash)
+            cx, cy = j(0.18 * t, 0.015), j(-0.33 * t, 0.015)
+            rx = vr.uniform(0.082, 0.098) * t
+            ry = vr.uniform(0.078, 0.096) * t
+            rot_a = vr.uniform(0, 6.28)
+            n_pts = 8
+            pts = []
+            for k in range(n_pts):
+                a = rot_a + 2 * math.pi * k / n_pts
+                rad_jit = 1.0 + r.uniform(-0.10, 0.10)
+                pts.append((cx + rx * rad_jit * math.cos(a), cy + ry * rad_jit * math.sin(a)))
+            d = "M%.1f %.1f" % pts[0] + "".join("L%.1f %.1f" % pt for pt in pts[1:]) + "Z"
+            p.append((color, '<path d="%s" fill="%s"/>' % (d, color)))
+            self.w = 0.36 * t
         elif ch == "≠":
             y1, y2 = vr.uniform(-0.24, -0.18), vr.uniform(-0.45, -0.39)
             w_bar = vr.uniform(0.46, 0.56)
@@ -217,6 +240,18 @@ class Symbol(Item):
                 q2 = _sample_quad(q1[-1], P(0.06 + w_w * 0.74, y + sgn * amp), P(0.06 + w_w, y + r.uniform(-0.02, 0.02)), 6)
                 p.append(_ribbon_path(q1 + q2[1:], color, e, r))
             self.w = (0.14 + w_w) * t
+        elif ch in "≪≫":
+            ym = vr.uniform(-0.34, -0.28)
+            sp = vr.uniform(0.18, 0.23)
+            cw = vr.uniform(0.24, 0.30)
+            step = vr.uniform(0.24, 0.30)
+            for k in (0, 1):
+                ox = 0.08 + k * step
+                if ch == "≪":
+                    p.append(stroke(hand, [P(ox + cw, ym - sp), P(ox, ym), P(ox + cw, ym + sp)], color, e))
+                else:
+                    p.append(stroke(hand, [P(ox, ym - sp), P(ox + cw, ym), P(ox, ym + sp)], color, e))
+            self.w = (0.18 + step + cw) * t
         elif ch in "∫∮":
             curl_top = vr.uniform(0.14, 0.24)
             curl_bot = vr.uniform(0.14, 0.24)
@@ -240,6 +275,51 @@ class Symbol(Item):
                 p.append(_ribbon_path(pts, color, e * 0.85, r, closed=False))
             self.w = (0.48 + lean * 0.45) * t
             self.asc, self.desc = 1.0 * t, 0.4 * t
+            return
+        elif ch in CIRCLED_DIGITS:
+            # Hand-circled numeral: writer's own digit centered inside an organic hand-drawn loop
+            num_str = str(ord(ch) - 0x2460 + 1)
+            two = len(num_str) > 1
+            rx = (vr.uniform(0.47, 0.52) if two else vr.uniform(0.39, 0.43)) * t
+            ry = (vr.uniform(0.39, 0.43) if two else vr.uniform(0.38, 0.42)) * t
+            cx = rx + 0.09 * t
+            cy = -0.36 * t + vr.uniform(-0.02, 0.02) * t
+            start_a = -math.pi * 0.5 + vr.uniform(-0.45, 0.45)
+            wob_ph = vr.uniform(0, 6.28)
+            wob_amp = vr.uniform(0.03, 0.06)
+            n_pts = 16
+            over = vr.choice((1, 2))
+            pts = []
+            for k in range(n_pts + over):
+                a = start_a + 2 * math.pi * k / n_pts
+                frac = k / n_pts
+                # Slight organic eccentricity + tiny spiral closure mismatch like a real pen loop
+                rad_mod = 1.0 + wob_amp * math.sin(2 * a + wob_ph) + (0.04 * (frac - 0.5) if frac > 0.85 else 0.0)
+                px = cx + rx * rad_mod * math.cos(a) + r.uniform(-0.4, 0.4)
+                py = cy + ry * rad_mod * math.sin(a) + r.uniform(-0.4, 0.4)
+                pts.append((px, py))
+            p.append(_ribbon_path(pts, color, e * 0.85, r, closed=False))
+
+            d_size = (0.56 if two else 0.66) * t
+            f_dig = hand._pick_font(num_str, 0)
+            b_dig = fonts.glyph_bounds(f_dig, num_str[0]) if f_dig else None
+            dig_mid_y = -0.34 * d_size
+            if b_dig:
+                sc_dig = hand._glyph_scale(num_str[0], f_dig, d_size)
+                dig_h = (b_dig[3] - b_dig[1]) * sc_dig
+                dig_mid_y = -0.5 * (b_dig[1] + b_dig[3]) * sc_dig
+                target_dh = (0.42 if two else 0.48) * t
+                if dig_h > 1e-3:
+                    adj = max(0.70, min(1.65, target_dh / dig_h))
+                    d_size *= adj
+                    dig_mid_y *= adj
+            inner = Text(hand, num_str, d_size, color)
+            ix = cx - inner.w * 0.5 + r.uniform(-0.02, 0.02) * t
+            iy = cy - dig_mid_y + r.uniform(-0.02, 0.02) * t
+            self.parts += inner.at(ix, iy)
+            self.w = cx + rx + 0.13 * t
+            self.asc = max(0.78 * t, -cy + ry + 0.06 * t)
+            self.desc = max(0.26 * t, cy + ry + 0.06 * t)
             return
         self.asc, self.desc = 0.78 * t, 0.26 * t
 
@@ -283,13 +363,21 @@ class Accent(Item):
 class Row(Item):
     """Items side by side."""
 
-    def __init__(self, items, gap=0.0):
+    def __init__(self, items, gap=0.0, gaps=None):
         super().__init__()
         self.gap = gap
+        self.gaps = list(gaps) if gaps is not None else None
         x = 0.0
-        for it in items:
-            self.parts += it.at(x, 0)
-            x += it.w + gap
+        if self.gaps is not None:
+            for idx, it in enumerate(items):
+                if idx > 0:
+                    x += self.gaps[idx - 1]
+                self.parts += it.at(x, 0)
+                x += it.w
+        else:
+            for it in items:
+                self.parts += it.at(x, 0)
+                x += it.w + gap
         self.items = items
         self.w = x
         self.asc = max([it.asc for it in items] or [0])
@@ -307,7 +395,7 @@ class Row(Item):
             x = 0.0
             orig_x = 0.0
             placed = []
-            for it in self.items:
+            for idx, it in enumerate(self.items):
                 if orig_x <= t0 * total:
                     u = 0.0
                 else:
@@ -316,8 +404,9 @@ class Row(Item):
                 sx = max(min_scale * 0.88, (1.0 - alpha * p) * g_scale)
                 sy = max(min_scale, (1.0 - 0.75 * alpha * p) * g_scale)
                 placed.append((it, x, sx, sy))
-                x += (it.w + self.gap) * sx
-                orig_x += it.w + self.gap
+                g_after = (self.gaps[idx] if idx < len(self.gaps) else 0.0) if self.gaps is not None else self.gap
+                x += (it.w + g_after) * sx
+                orig_x += it.w + g_after
             return x, placed
 
         # Solve tail compression alpha via binary search
@@ -606,3 +695,307 @@ def words(s):
         else:
             k += 1
     return out
+
+
+def _read_cmd_token(s: str, i: int) -> tuple[str, int]:
+    """Read a penpad markup command (\\f{a}{b}, \\i{a}{b}, \\r{a}, \\p{a}, \\q{a}, \\h{a}) from s[i:]."""
+    cmd = s[i + 1]
+    j = i + 2
+    n_args = 2 if cmd in "fi" else 1
+    for _ in range(n_args):
+        if j < len(s) and s[j] == "{":
+            _, j = _group(s, j)
+        elif j < len(s):
+            _, j = _group(s, j)
+    return s[i:j], j
+
+
+def _unwrap_highlight(tok: str) -> str | None:
+    """If tok is a single ``\\h{...}`` construct, return its inner markup; else None."""
+    if not tok.startswith("\\h{") or not tok.endswith("}"):
+        return None
+    inner, end = _group(tok, 2)
+    return inner if end == len(tok) else None
+
+
+def _strip_markup_edges(tok: str) -> str:
+    """Strip outer \\h{...} to inspect boundary characters for CJK spacing decisions."""
+    inner = _unwrap_highlight(tok)
+    return inner if inner is not None else tok
+
+
+def _starts_cjk(tok: str) -> bool:
+    s = _strip_markup_edges(tok)
+    return bool(s) and is_cjk(s[0])
+
+
+def _ends_cjk(tok: str) -> bool:
+    s = _strip_markup_edges(tok)
+    return bool(s) and is_cjk(s[-1])
+
+
+def _ends_cjk_close_punct(tok: str) -> bool:
+    s = _strip_markup_edges(tok)
+    return bool(s) and s[-1] in CJK_CLOSE_PUNCT
+
+
+def tokenize_line(s: str) -> list[tuple[str, str]]:
+    """Split a penpad-markup paragraph into breakable ``(token, sep_before)`` pairs.
+
+    ``sep_before`` is one of:
+    - ``"none"``: zero gap (first token, or adjacent CJK characters)
+    - ``"space"``: normal inter-word space from an explicit ASCII space
+    - ``"cjk_latin"``: subtle visual gap automatically inserted between CJK and Latin/math
+    - ``"cjk_punct_space"``: subtle gap when an explicit space follows fullwidth CJK punctuation
+
+    Pure non-CJK text uses ``words(s)`` unchanged for 100% backwards compatibility.
+    """
+    if not has_cjk(s):
+        ws = words(s)
+        return [(w, "space" if idx > 0 else "none") for idx, w in enumerate(ws)]
+
+    raw: list[tuple[str, bool]] = []   # (token, had_explicit_space_before)
+    cur: list[str] = []
+    pending_space = False
+    pending_open = ""
+    i = 0
+
+    def flush_cur():
+        nonlocal pending_space, pending_open
+        if cur:
+            tok = pending_open + "".join(cur)
+            raw.append((tok, pending_space and bool(raw)))
+            cur.clear()
+            pending_space = False
+            pending_open = ""
+
+    while i < len(s):
+        ch = s[i]
+        if ch == "\\" and i + 1 < len(s):
+            nxt = s[i + 1]
+            if nxt == "h":
+                flush_cur()
+                cmd_tok, j = _read_cmd_token(s, i)
+                if pending_open:
+                    # Attach opening punct inside the highlight if appropriate, or keep adjacent
+                    raw.append((pending_open, pending_space and bool(raw)))
+                    pending_open = ""
+                    pending_space = False
+                raw.append((cmd_tok, pending_space and bool(raw)))
+                pending_space = False
+                i = j
+                continue
+            if nxt in "fipqr":
+                cmd_tok, j = _read_cmd_token(s, i)
+                cur.append(cmd_tok)
+                i = j
+                continue
+            cur.append(s[i:i + 2])
+            i += 2
+            continue
+        if ch in "_^":
+            cur.append(ch)
+            i += 1
+            if i < len(s):
+                if s[i] == "{":
+                    _, j = _group(s, i)
+                    cur.append(s[i:j])
+                    i = j
+                else:
+                    g, j = _group(s, i)
+                    cur.append(g)
+                    i = j
+            continue
+        if ch == " ":
+            flush_cur()
+            pending_space = True
+            i += 1
+            continue
+        if ch in CJK_OPEN_PUNCT:
+            flush_cur()
+            pending_open += ch
+            i += 1
+            continue
+        if ch in CJK_CLOSE_PUNCT:
+            if cur:
+                cur.append(ch)
+                flush_cur()
+            elif raw and not pending_space and not pending_open and _unwrap_highlight(raw[-1][0]) is None:
+                prev_tok, prev_sp = raw[-1]
+                raw[-1] = (prev_tok + ch, prev_sp)
+            else:
+                cur.append(ch)
+                flush_cur()
+            i += 1
+            continue
+        if is_cjk(ch):
+            flush_cur()
+            tok = pending_open + ch
+            sp = pending_space and bool(raw)
+            pending_open = ""
+            pending_space = False
+            i += 1
+            # Consume trailing Kinsoku closing punctuation (避头)
+            while i < len(s) and (s[i] in CJK_CLOSE_PUNCT or s[i] in ASCII_NO_START):
+                tok += s[i]
+                i += 1
+            raw.append((tok, sp))
+            continue
+        cur.append(ch)
+        i += 1
+
+    flush_cur()
+    if pending_open:
+        if raw and not pending_space and _unwrap_highlight(raw[-1][0]) is None:
+            prev_tok, prev_sp = raw[-1]
+            raw[-1] = (prev_tok + pending_open, prev_sp)
+        else:
+            raw.append((pending_open, pending_space and bool(raw)))
+
+    # Glue standalone operators with their immediate neighbors (same rule as words())
+    k = 0
+    while k < len(raw):
+        tok_k, sp_k = raw[k]
+        if tok_k in OPERATORS and 0 < k < len(raw) - 1:
+            prev_tok, prev_sp = raw[k - 1]
+            nxt_tok, nxt_sp = raw[k + 1]
+            if _unwrap_highlight(prev_tok) is None and _unwrap_highlight(nxt_tok) is None:
+                s1 = " " if sp_k else ""
+                s2 = " " if nxt_sp else ""
+                raw[k - 1:k + 2] = [(prev_tok + s1 + tok_k + s2 + nxt_tok, prev_sp)]
+                k = max(0, k - 1)
+                continue
+        k += 1
+
+    out: list[tuple[str, str]] = []
+    for idx, (tok, had_sp) in enumerate(raw):
+        if idx == 0:
+            out.append((tok, "none"))
+            continue
+        prev_tok = raw[idx - 1][0]
+        if had_sp:
+            sep = "cjk_punct_space" if _ends_cjk_close_punct(prev_tok) else "space"
+        else:
+            prev_cjk = _ends_cjk(prev_tok)
+            cur_cjk = _starts_cjk(tok)
+            if prev_cjk and cur_cjk:
+                sep = "none"
+            elif prev_cjk != cur_cjk:
+                # Avoid extra gap right inside CJK brackets/quotes or before closing punctuation
+                prev_s = _strip_markup_edges(prev_tok)
+                cur_s = _strip_markup_edges(tok)
+                if (prev_s and prev_s[-1] in CJK_OPEN_PUNCT) or (cur_s and cur_s[0] in CJK_CLOSE_PUNCT):
+                    sep = "none"
+                elif prev_s and prev_s[-1] in CJK_CLOSE_PUNCT:
+                    sep = "none"
+                else:
+                    sep = "cjk_latin"
+            else:
+                sep = "none"
+        out.append((tok, sep))
+    return out
+
+
+def coalesce_line_tokens(line_tokens: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Merge adjacent zero-gap plain runs and adjacent same-line ``\\h{...}`` highlights.
+
+    - Merging zero-gap CJK runs keeps the writer's continuous baseline drift and word tilt
+      across whole phrases while producing cleaner, smaller merged vector paths.
+    - Merging consecutive same-line ``\\h{...}`` tokens produces one smooth continuous
+      highlighter stroke instead of overlapping double-opacity seams.
+    """
+    if len(line_tokens) <= 1:
+        return list(line_tokens)
+    merged: list[tuple[str, str]] = []
+    for tok, sep in line_tokens:
+        if not merged:
+            merged.append((tok, "none"))
+            continue
+        prev_tok, prev_sep = merged[-1]
+        prev_hl = _unwrap_highlight(prev_tok)
+        cur_hl = _unwrap_highlight(tok)
+        if prev_hl is not None and cur_hl is not None:
+            joiner = {"none": "", "space": " ", "cjk_latin": "\u2009", "cjk_punct_space": "\u2009"}[sep]
+            merged[-1] = ("\\h{%s%s%s}" % (prev_hl, joiner, cur_hl), prev_sep)
+            continue
+        if prev_hl is None and cur_hl is None and sep == "none":
+            merged[-1] = (prev_tok + tok, prev_sep)
+            continue
+        merged.append((tok, sep))
+    return merged
+
+
+def measure_markup(hand, s: str, size: float) -> float:
+    """Fast deterministic width estimate for a penpad-markup token (used for CJK wrapping)."""
+    w, buf, i = 0.0, [], 0
+
+    def flush_buf():
+        nonlocal w
+        if buf:
+            run = "".join(buf)
+            buf.clear()
+            plain = []
+            for ch in run:
+                if ch in DRAWN:
+                    if plain:
+                        w += hand.measure("".join(plain), size)
+                        plain.clear()
+                    if ch in "·•":
+                        w += 0.38 * size
+                    elif ch in CIRCLED_DIGITS:
+                        w += (1.16 if ord(ch) - 0x2460 >= 9 else 1.04) * size
+                    elif ch in "∫∮":
+                        w += 0.60 * size
+                    else:
+                        w += 0.85 * size
+                elif ch in ACCENTS:
+                    continue
+                else:
+                    plain.append(ch)
+            if plain:
+                w += hand.measure("".join(plain), size)
+
+    while i < len(s):
+        ch = s[i]
+        if ch == "\\" and i + 1 < len(s) and s[i + 1] in ESCAPABLE:
+            buf.append(s[i + 1])
+            i += 2
+            continue
+        if ch == "\\" and i + 1 < len(s) and s[i + 1] in "fipqrh":
+            flush_buf()
+            cmd = s[i + 1]
+            i += 2
+            if cmd == "f":
+                a, i = _group(s, i)
+                b, i = _group(s, i)
+                w += max(measure_markup(hand, a, size * 0.86), measure_markup(hand, b, size * 0.86)) + 0.45 * size
+            elif cmd == "i":
+                a, i = _group(s, i)
+                b, i = _group(s, i)
+                w += 0.60 * size + max(
+                    measure_markup(hand, a, size * 0.66) if a else 0.0,
+                    measure_markup(hand, b, size * 0.66) if b else 0.0,
+                )
+            elif cmd == "r":
+                a, i = _group(s, i)
+                w += 0.68 * size + measure_markup(hand, a, size)
+            elif cmd == "h":
+                a, i = _group(s, i)
+                w += measure_markup(hand, a, size)
+            else:
+                a, i = _group(s, i)
+                w += 0.72 * size + measure_markup(hand, a, size)
+            continue
+        if ch in "_^":
+            flush_buf()
+            sw = 0.0
+            while i < len(s) and s[i] in "_^":
+                g, j = _group(s, i + 1)
+                sw = max(sw, measure_markup(hand, g, size * 0.72) + 0.10 * size)
+                i = j
+            w += sw
+            continue
+        buf.append(ch)
+        i += 1
+    flush_buf()
+    return w

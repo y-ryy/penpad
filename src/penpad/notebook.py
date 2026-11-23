@@ -10,15 +10,37 @@ import xml.etree.ElementTree as ET
 from concurrent.futures import ProcessPoolExecutor
 
 from . import raster, vector
+from .cjk import has_cjk
 from .hand import Hand, _OU, hand_line
 from .latex import escape_text, latex_to_markup
-from .layout import Box, Item, Row, parse, stroke, words
+from .layout import Box, Item, Row, coalesce_line_tokens, measure_markup, parse, stroke, tokenize_line, words
 from .paper import get_paper
 from .styles import get_style, ink
 
 log = logging.getLogger("penpad")
 
 MIN_FIT = 0.62   # an equation may shrink to this fraction of the letter size to fit the line
+
+_DENSITY_CFG = {
+    "compact": dict(
+        bottom_g=1.8, space_scale=0.45,
+        title_before=0.25, title_after=0.14, title_ensure=2.6,
+        heading_before=0.12, heading_ensure=2.2,
+        eq_before=1.5, fig_pad=0.25, default_ls=0.0,
+    ),
+    "normal": dict(
+        bottom_g=2.5, space_scale=1.0,
+        title_before=0.6, title_after=0.3, title_ensure=4.0,
+        heading_before=0.3, heading_ensure=3.0,
+        eq_before=4.0, fig_pad=0.5, default_ls=0.0,
+    ),
+    "spacious": dict(
+        bottom_g=2.6, space_scale=1.35,
+        title_before=0.85, title_after=0.45, title_ensure=4.5,
+        heading_before=0.5, heading_ensure=3.5,
+        eq_before=8.0, fig_pad=0.7, default_ls=0.18,
+    ),
+}
 
 
 def _render_page(args):
@@ -44,16 +66,23 @@ class Notebook:
         self.paper = get_paper(paper)
         self.style = get_style(style, **overrides)
         self.W, self.H = self.paper.size_px
-        self.size = self.paper.text_size
+        self.size = self.paper.text_size * float(self.style.get("size_scale", 1.0))
         self.M = self.paper.margin
         self.G = self.paper.pitch
         self.pen = self.paper.pen_scale
         self.seed = seed
         self.footer = footer
         self.doc_title = title
-        self.accent = ink(accent)
+        self.accent = self._ink(accent)
         self.pages = []
         self.new_page()
+
+    def _ink(self, color) -> str:
+        """Resolve an ink name/#hex, honoring style['monochrome'] without mutating global INKS."""
+        mono = self.style.get("monochrome")
+        if mono:
+            return ink("black" if mono is True else mono)
+        return ink(color)
 
     # ------------------------------------------------------------------ pages
     def new_page(self):
@@ -66,8 +95,15 @@ class Notebook:
 
     page_break = new_page
 
+    def _density(self) -> dict:
+        return _DENSITY_CFG[self.style.get("density", "normal")]
+
+    def _effective_line_spacing(self) -> float:
+        ls = float(self.style.get("line_spacing", 0.0))
+        return ls if ls > 0 else self._density()["default_ls"]
+
     def _bottom(self):
-        return self.H - self.G * 2.5
+        return self.H - self.G * self._density()["bottom_g"]
 
     def _empty(self):
         return not (self.page["inked"] or self.page["strokes"] or self.page["highlights"])
@@ -76,10 +112,15 @@ class Notebook:
         if self.cursor + height > self._bottom() and not self._empty():
             self.new_page()
 
+    def ensure_lines(self, lines: float):
+        """Start a new page if fewer than ``lines`` ruling rows remain on the current page."""
+        self._ensure(lines * self.G * (1.0 + self._effective_line_spacing()))
+
     def _baseline(self, asc):
         # handwriting may touch the descenders of the line above, but never sits under a
         # fraction, an integral or a long subscript
-        tol = 0.35 * self.size if self.paper.ruling == "grid" else 0.0
+        ls = self._effective_line_spacing()
+        tol = 0.35 * self.size if (self.paper.ruling == "grid" and ls <= 0) else 0.0
         if self._last_desc > 0.6 * self.size:
             tol = 0
         snapped = math.ceil((self.cursor + asc + 3 - tol) / self.G) * self.G
@@ -114,6 +155,9 @@ class Notebook:
             mx = max(self.M * 0.5, min(mx, self.W - self.M * 0.4 - item.w))
         self.place(item, mx, base)
         self.cursor = base + item.desc
+        ls = self._effective_line_spacing()
+        if ls > 0:
+            self.cursor += ls * self.G
         self._last_desc = item.desc
         return base
 
@@ -137,27 +181,33 @@ class Notebook:
 
     # ---------------------------------------------------------------- content
     def space(self, lines=1):
-        self.cursor += lines * self.G
+        self.cursor += lines * self.G * self._density()["space_scale"]
 
     def title(self, s, color=None, underline=False):
         if self.doc_title is None:
             self.doc_title = s
-        color = ink(color) if color else self.accent
-        self._ensure(self.G * 4)
+        color = self._ink(color) if color else self.accent
+        d = self._density()
+        min_orph = int(self.style.get("min_orphan_lines", 0))
+        need_g = max(d["title_ensure"], (2.0 + min_orph) if min_orph > 0 else 0.0)
+        self._ensure(self.G * need_g)
         size = self.size * 1.2
         it = self._fit(lambda t: Row(parse(self.hand, s, t, color)), size, self.W - 2 * self.M, s)
-        base = self._line(it, self.M, before=self.G * 0.6)
-        y = base + 0.3 * size
+        base = self._line(it, self.M, before=self.G * d["title_before"])
+        y = base + d["title_after"] * size
         if underline:
             self.page["inked"].append(stroke(self.hand, [(self.M - 4, y), (self.M + it.w * 0.9, y + 1.5)],
                                              color, self.style["pen_width"] * size))
-        self.cursor = y + 4
+        self.cursor = y + (4 if underline or self.style.get("density", "normal") != "compact" else 1)
 
     def heading(self, s, color=None):
-        color = ink(color or "purple")
-        self._ensure(self.G * 3)
+        color = self._ink(color or "purple")
+        d = self._density()
+        min_orph = int(self.style.get("min_orphan_lines", 0))
+        need_g = max(d["heading_ensure"], (1.8 + min_orph) if min_orph > 0 else 0.0)
+        self._ensure(self.G * need_g)
         it = self._fit(lambda t: Row(parse(self.hand, s, t, color)), self.size * 1.08, self.W - 2 * self.M, s)
-        self._line(it, self.M, before=self.G * 0.3)
+        self._line(it, self.M, before=self.G * d["heading_before"])
 
     def _false_start(self, word, size, color):
         """Occasional 2-3 letter false start crossed out with a quick hand stroke."""
@@ -182,22 +232,82 @@ class Notebook:
             ))
         return it
 
+    def _text_cjk(self, s, indent, hanging, color, size):
+        """CJK-aware wrapping: breaks between ideographs with Kinsoku rules, auto CJK-Latin
+        micro-spacing, and coalesces same-line runs/highlights before rendering."""
+        width = self.W - 2 * self.M - indent
+        gap_px = {
+            "none": 0.0,
+            "space": 0.42 * size,
+            "cjk_latin": 0.16 * size,
+            "cjk_punct_space": 0.12 * size,
+        }
+        tokens = tokenize_line(s)
+        if not tokens:
+            return
+        lines: list[list[tuple[str, str]]] = []
+        cur_line: list[tuple[str, str]] = []
+        cur_w = 0.0
+        first = True
+        for tok, sep in tokens:
+            room = width - (0 if first else hanging)
+            g = gap_px[sep] if cur_line else 0.0
+            tw = measure_markup(self.hand, tok, size)
+            if cur_line and cur_w + g + tw > room * 0.98:
+                lines.append(cur_line)
+                cur_line = [(tok, "none")]
+                cur_w = tw
+                first = False
+            else:
+                cur_line.append((tok, sep if cur_line else "none"))
+                cur_w += g + tw
+        if cur_line:
+            lines.append(cur_line)
+
+        # Orphan protection: if a multi-line block would leave only 1..(min_orphan_lines-1)
+        # lines at the bottom of the current page, move the entire block to the next page.
+        min_orph = int(self.style.get("min_orphan_lines", 0))
+        if min_orph > 0 and len(lines) >= 2 and not self._empty():
+            line_pitch = self.G * (1.0 + self._effective_line_spacing())
+            rem = self._bottom() - self.cursor
+            fit_lines = int(max(0.0, rem) // line_pitch)
+            if fit_lines < len(lines) and fit_lines < min_orph:
+                self.new_page()
+
+        for idx, raw_line in enumerate(lines):
+            room = width - (0 if idx == 0 else hanging)
+            x0 = self.M + indent + (0 if idx == 0 else hanging)
+            merged = coalesce_line_tokens(raw_line)
+            gaps = [gap_px[sep] for _, sep in merged[1:]]
+
+            def build_row(sz, _merged=merged, _gaps=gaps, _size=size):
+                ratio = sz / _size
+                items = [Row(parse(self.hand, t, sz, color)) for t, _ in _merged]
+                return Row(items, gaps=[g * ratio for g in _gaps])
+
+            label = "".join(t for t, _ in merged)
+            row = self._fit(build_row, size, room, label, progressive=True)
+            self._line(row, x0)
+
     def text(self, s, indent=0, hanging=0, color="black", size=None, markup=True):
-        """Paragraph with word wrap. ``hanging`` indents the lines after the first.
+        """Paragraph with word wrap (and native CJK Kinsoku wrap). ``hanging`` indents lines after the first.
 
         With ``markup=False`` the string is taken literally (no subscripts or commands).
         """
-        color, size = ink(color), size or self.size
+        color, size = self._ink(color), size or self.size
         if not markup:
             s = escape_text(s)
+        if has_cjk(s):
+            self._text_cjk(s, indent, hanging, color, size)
+            return
         width = self.W - 2 * self.M - indent
         space = 0.42 * size
         corr_rate = self.style.get("correction_rate", 0.0)
         line, w, first = [], 0.0, True
         for word in words(s):
             room = width - (0 if first else hanging)
-            # Subtle occasional false-start + strikethrough on plain alphabetic prose words
-            if (corr_rate > 0 and len(word) >= 5 and word.isalpha()
+            # Subtle occasional false-start + strikethrough on plain ASCII alphabetic prose words
+            if (corr_rate > 0 and len(word) >= 5 and word.isascii() and word.isalpha()
                     and self.hand.rng.random() < corr_rate):
                 fs = self._false_start(word, size, color)
                 if line and w + space + fs.w > room:
@@ -216,7 +326,7 @@ class Notebook:
 
     def eq(self, s, indent=36, center=False, box=False, color="black", box_color="red", size=None):
         """One line of penpad math markup. Too wide? Squeezes the tail first, like on paper."""
-        color, box_color, size = ink(color), ink(box_color), size or self.size
+        color, box_color, size = self._ink(color), self._ink(box_color), size or self.size
         indent = 0 if center else indent * self.size / 24
         room = self.W - 2 * self.M - indent
         if box:
@@ -226,7 +336,7 @@ class Notebook:
         else:
             it = self._fit(lambda t: Row(parse(self.hand, s, t, color)), size, room, s, progressive=True)
         x = (self.W - it.w) / 2 if center else self.M + indent
-        self._line(it, x, before=4 if it.asc > size else 0, jitter_margin=not center)
+        self._line(it, x, before=self._density()["eq_before"] if it.asc > size else 0, jitter_margin=not center)
 
     def math(self, latex, **kw):
         """Like eq, but takes LaTeX: ``nb.math(r"\\int_0^1 x^2\\,dx = \\frac{1}{3}")``."""
@@ -234,8 +344,9 @@ class Notebook:
 
     def figure(self, height, draw):
         """Reserve height px and call draw(notebook, x0, y0) to sketch inside it."""
-        self._ensure(height + self.G)
-        y0 = math.ceil((self.cursor + self.G * 0.5) / self.G) * self.G
+        pad = self._density()["fig_pad"]
+        self._ensure(height + self.G * max(0.5, pad * 2))
+        y0 = math.ceil((self.cursor + self.G * pad) / self.G) * self.G
         draw(self, self.M, y0)
         self.cursor = y0 + height
 
@@ -253,7 +364,7 @@ class Notebook:
         ind = indent * self.size / 24.0
         bar_x = self.M + ind * 0.45
         bar_w = max(1.4, self.style["stroke_width"] * self.pen * 0.9)
-        bar_col = ink(bar_color)
+        bar_col = self._ink(bar_color)
 
         def draw_bar(page_obj, y_top, y_bot):
             if y_bot <= y_top:
@@ -325,7 +436,7 @@ class Notebook:
 
     # ------------------------------------------------------- sketch primitives
     def write(self, x, y, s, size=None, color="black", anchor="start"):
-        color, size = ink(color), size or self.size * 0.85
+        color, size = self._ink(color), size or self.size * 0.85
         it = Row(parse(self.hand, s, size, color))
         dx = {"start": 0, "middle": -it.w / 2, "end": -it.w}[anchor]
         self.place(it, x + dx, y)
@@ -337,7 +448,7 @@ class Notebook:
         d = hand_line(x1, y1, x2, y2, self.hand.rng, rough, bow)
         dash = ' stroke-dasharray="9 7"' if dashed else ""
         self.page["strokes"].append('<path d="%s" fill="none" stroke="%s" stroke-width="%.2f" '
-                                    'stroke-linecap="round"%s/>' % (d, ink(color), width, dash))
+                                    'stroke-linecap="round"%s/>' % (d, self._ink(color), width, dash))
 
     def arrow(self, x1, y1, x2, y2, color="black", width=None, head=11):
         width = width or self.style["stroke_width"] * self.pen * 0.9
@@ -362,7 +473,7 @@ class Notebook:
             d += " C%.1f %.1f %.1f %.1f %.1f %.1f" % (c1 + c2 + p2)
         dash = ' stroke-dasharray="9 7"' if dashed else ""
         self.page["strokes"].append('<path d="%s" fill="none" stroke="%s" stroke-width="%.2f" '
-                                    'stroke-linecap="round" stroke-linejoin="round"%s/>' % (d, ink(color), width, dash))
+                                    'stroke-linecap="round" stroke-linejoin="round"%s/>' % (d, self._ink(color), width, dash))
 
     def circle(self, cx, cy, r, color="black", width=None):
         n = 14
@@ -372,13 +483,14 @@ class Notebook:
     # ------------------------------------------------------------------ output
     def _pages_with_footers(self):
         out = []
+        footer_col = self._ink("gray") if self.style.get("monochrome_footer") else ink("gray")
         for n, page in enumerate(self.pages, 1):
             inked = list(page["inked"])
             if self.footer:
                 hand = Hand(self.style, self.seed * 7919 + n)
                 svg, _ = hand.write(self.W - self.M, self.H - self.G * 1.2, "%s  %d" % (self.footer, n),
-                                    ink("gray"), self.size * 0.7, "end")
-                inked.append((ink("gray"), svg))
+                                    footer_col, self.size * 0.7, "end")
+                inked.append((footer_col, svg))
             out.append({
                 "highlights": list(page["highlights"]),
                 "strokes": list(page["strokes"]),

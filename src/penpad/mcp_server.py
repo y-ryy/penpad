@@ -94,9 +94,13 @@ def output_dir() -> str:
 
 def _slug(s: str) -> str:
     s = re.sub(r"\$[^$]*\$", "", s)
-    s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode()
-    s = re.sub(r"[^\w\s-]", "", s).strip().lower()
-    return re.sub(r"[\s_-]+", "-", s)[:60].strip("-")
+    ascii_s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode()
+    ascii_s = re.sub(r"[^\w\s-]", "", ascii_s).strip().lower()
+    ascii_slug = re.sub(r"[\s_-]+", "-", ascii_s)[:60].strip("-")
+    if ascii_slug:
+        return ascii_slug
+    uni = re.sub(r"[^\w\s-]", "", s).strip()
+    return re.sub(r"[\s_-]+", "-", uni)[:40].strip("-")
 
 
 def _filename(markdown: str, filename: str | None) -> str:
@@ -125,7 +129,13 @@ def render(markdown, paper="goodnotes", style="cursive", seed=1, footer=None,
     with _lock:
         log.addHandler(collect)
         try:
-            nb = render_markdown(markdown, paper=paper, style=style, seed=seed, footer=footer or None)
+            extra = {}
+            cjk_env = os.environ.get("PENPAD_CJK_FONT")
+            if cjk_env and os.path.exists(cjk_env):
+                extra["cjk_font"] = cjk_env
+                if style != "cjk":
+                    extra["cjk_scale"] = "auto"
+            nb = render_markdown(markdown, paper=paper, style=style, seed=seed, footer=footer or None, **extra)
             pdf_bytes = nb.render_pdf_bytes(vector_pdf=True)
             preview_img = nb.render_page(0, dpi=dpi) if preview else None
         finally:
